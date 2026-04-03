@@ -12,6 +12,14 @@ async function runHTTP(): Promise<void> {
     res.json({ status: 'ok', server: 'session-handoff-mcp-server', version: '1.0.0' });
   });
 
+  app.get('/mcp', (_req, res) => {
+    res.json({
+      name: 'session-handoff-mcp-server',
+      version: '1.0.0',
+      transport: 'streamable-http'
+    });
+  });
+
   app.post('/mcp', async (req, res) => {
     const server = new McpServer({ name: 'session-handoff-mcp-server', version: '1.0.0' });
     registerHandoffTools(server);
