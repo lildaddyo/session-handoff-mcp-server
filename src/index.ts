@@ -5,6 +5,7 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import { registerHandoffTools } from './tools/handoff.js';
+import { requireMcpAuth, logAuthStartupState, parseBodyLimit, parseIntEnv } from './security.js';
 
 // ─── CORS middleware ──────────────────────────────────────────────────────────
 // claude.ai makes browser-side cross-origin requests; without these headers
@@ -57,46 +58,86 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
 }
 
+// Express 4 does not catch rejected promises from async handlers; on Node 20+
+// an unhandled rejection kills the process, so one bad request could take the
+// server down. Catch here and answer with a generic JSON-RPC error.
+async function safeHandleMcpRequest(req: Request, res: Response): Promise<void> {
+  try {
+    await handleMcpRequest(req, res);
+  } catch (err) {
+    console.error('[session-handoff-mcp] /mcp handler error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
+    }
+  }
+}
+
 // ─── HTTP server ──────────────────────────────────────────────────────────────
 async function runHTTP(): Promise<void> {
   const app = express();
+  app.disable('x-powered-by');
   // Railway terminates TLS in one proxy hop; trust it so req.ip (and the
   // rate-limit key) is the real client address, not the proxy's.
   app.set('trust proxy', 1);
+  // CORS first, so preflights never hit the body parser and 413/400 errors
+  // still carry CORS headers a browser client can read.
+  app.use(corsMiddleware);
   // 1 MB is far more than any tool call carries (a model cannot emit a
   // multi-megabyte argument); the old 10 MB limit only helped abusers.
-  app.use(express.json({ limit: process.env.MAX_BODY_SIZE ?? '1mb' }));
-  app.use(corsMiddleware);
+  // MAX_BODY_SIZE is validated and capped at 4 MB (an unparseable value would
+  // otherwise disable body-parser's limit entirely).
+  app.use(express.json({ limit: parseBodyLimit(process.env.MAX_BODY_SIZE) }));
 
-  // Per-IP limit on the MCP endpoint. A normal session makes a handful of
-  // requests (initialize, tools/list, one or two tool calls), so the default
-  // of 120/min leaves wide headroom while capping CPU and Notion API burn.
+  // Per-IP limit on the MCP endpoint (covers /mcp and /mcp/<token>). A normal
+  // session makes a handful of requests (initialize, tools/list, one or two
+  // tool calls), so the default of 120/min leaves wide headroom while capping
+  // CPU, Notion API burn and token guessing.
   const mcpLimiter = rateLimit({
     windowMs: 60_000,
-    limit: parseInt(process.env.MCP_RATE_LIMIT_PER_MIN ?? '120', 10) || 120,
+    limit: parseIntEnv(process.env.MCP_RATE_LIMIT_PER_MIN, 120, 1, 10_000),
     standardHeaders: 'draft-8',
     legacyHeaders: false,
   });
   app.use('/mcp', mcpLimiter);
 
-  // Health — no auth needed, no CORS gate
+  // Health — no auth needed, no CORS gate. Stays up even when MCP_AUTH_TOKEN
+  // is missing so Railway's healthcheck passes and the new (fail-closed)
+  // deployment replaces any older one.
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', server: 'session-handoff-mcp-server', version: '1.0.0' });
   });
 
-  // GET /mcp — routed through the transport.
-  // In stateless mode the SDK returns 405; that is correct per the MCP spec and
-  // tells claude.ai "stateless HTTP, POST only".  A bare JSON response was
-  // misleading and could confuse the discovery handshake.
-  app.get('/mcp', async (req, res) => {
-    await handleMcpRequest(req, res);
+  // MCP endpoint. Auth: /mcp/<token> (claude.ai connectors) or /mcp with
+  // "Authorization: Bearer <token>" (Claude Code). See security.ts.
+  // GET answers 405 directly. Routed through the stateless transport it opened
+  // an SSE stream that never sends or closes (each GET held a connection open
+  // until a proxy reset it). 405 + Allow: POST is what the MCP spec expects
+  // from a stateless server and is what claude.ai's probe needs.
+  const methodNotAllowed = (_req: Request, res: Response): void => {
+    res.setHeader('Allow', 'POST');
+    res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
+  };
+  for (const path of ['/mcp', '/mcp/:token']) {
+    app.get(path, requireMcpAuth, methodNotAllowed);
+    app.post(path, requireMcpAuth, safeHandleMcpRequest);
+  }
+
+  // Body-parser errors (413 too large, 400 bad JSON) and anything else that
+  // reaches Express's error path: answer in JSON without the stack trace the
+  // default handler prints when NODE_ENV is not "production".
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) { next(err); return; }
+    const e = err as { status?: number; statusCode?: number; type?: string };
+    const status = e.status ?? e.statusCode ?? 500;
+    const message =
+      status === 413 ? 'Request body too large'
+      : status === 400 ? 'Parse error'
+      : 'Internal error';
+    if (status >= 500) console.error('[session-handoff-mcp] request error:', err);
+    res.status(status).json({ jsonrpc: '2.0', error: { code: status === 400 ? -32700 : -32600, message }, id: null });
   });
 
-  // POST /mcp — main JSON-RPC entry point
-  app.post('/mcp', async (req, res) => {
-    await handleMcpRequest(req, res);
-  });
-
+  logAuthStartupState();
   const port = parseInt(process.env.PORT ?? '3000');
   app.listen(port, () =>
     console.error(`[session-handoff-mcp] HTTP server running on port ${port}`)
