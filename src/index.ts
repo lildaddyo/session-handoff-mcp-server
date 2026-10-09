@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
+import { rateLimit } from 'express-rate-limit';
 import { registerHandoffTools } from './tools/handoff.js';
 
 // ─── CORS middleware ──────────────────────────────────────────────────────────
@@ -59,8 +60,24 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
 // ─── HTTP server ──────────────────────────────────────────────────────────────
 async function runHTTP(): Promise<void> {
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  // Railway terminates TLS in one proxy hop; trust it so req.ip (and the
+  // rate-limit key) is the real client address, not the proxy's.
+  app.set('trust proxy', 1);
+  // 1 MB is far more than any tool call carries (a model cannot emit a
+  // multi-megabyte argument); the old 10 MB limit only helped abusers.
+  app.use(express.json({ limit: process.env.MAX_BODY_SIZE ?? '1mb' }));
   app.use(corsMiddleware);
+
+  // Per-IP limit on the MCP endpoint. A normal session makes a handful of
+  // requests (initialize, tools/list, one or two tool calls), so the default
+  // of 120/min leaves wide headroom while capping CPU and Notion API burn.
+  const mcpLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: parseInt(process.env.MCP_RATE_LIMIT_PER_MIN ?? '120', 10) || 120,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+  });
+  app.use('/mcp', mcpLimiter);
 
   // Health — no auth needed, no CORS gate
   app.get('/health', (_req, res) => {
