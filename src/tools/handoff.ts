@@ -3,11 +3,13 @@ import { createHandoffPage } from '../services/notion.js';
 import { parseConversation, buildHandoffDoc } from '../services/parser.js';
 import { HandoffFullSchema, HandoffDocOnlySchema, PushNotionSchema, ExtractContextSchema } from '../schemas/index.js';
 import type { HandoffDoc } from '../types.js';
+import { resolveParentPageId, takeNotionWriteSlot, publicErrorMessage } from '../security.js';
 
+// The parent page override is honoured only if it is the configured default
+// or on NOTION_ALLOWED_PARENT_PAGE_IDS (see security.ts); otherwise a caller
+// could write into any page shared with the integration.
 function getParentPageId(override?: string): string {
-  const id = override ?? process.env.NOTION_PARENT_PAGE_ID;
-  if (!id) throw new Error('Notion parent page ID required. Pass notion_parent_page_id or set NOTION_PARENT_PAGE_ID env var');
-  return id;
+  return resolveParentPageId(override);
 }
 
 function formatHandoffOutput(doc: HandoffDoc): string {
@@ -51,10 +53,12 @@ Returns: Full structured handoff doc + Notion URL + paste-ready continuation pro
       if (params.push_to_notion) {
         try {
           const parentId = getParentPageId(params.notion_parent_page_id);
+          takeNotionWriteSlot();
           const notionResult = await createHandoffPage(doc, parentId);
           doc.notionPageUrl = notionResult.url;
         } catch (notionErr) {
-          doc.notionPageUrl = `[Notion push failed: ${notionErr instanceof Error ? notionErr.message : String(notionErr)}]`;
+          // Raw Notion error text can leak workspace details; return a code only.
+          doc.notionPageUrl = `[${publicErrorMessage(notionErr, 'Notion push')}]`;
         }
       }
       return { content: [{ type: 'text', text: formatHandoffOutput(doc) }] };
@@ -99,10 +103,11 @@ Returns: Full structured handoff doc + Notion URL + paste-ready continuation pro
         contextDump: params.context_dump,
         continuationPrompt: params.continuation_prompt
       };
+      takeNotionWriteSlot();
       const result = await createHandoffPage(doc, parentId);
       return { content: [{ type: 'text', text: `✅ Notion page created!\n\nTitle: ${result.title}\nURL: ${result.url}\nID: ${result.id}` }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${publicErrorMessage(err, 'Notion push')}` }], isError: true };
     }
   });
 
